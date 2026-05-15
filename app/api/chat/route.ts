@@ -36,6 +36,7 @@ export async function POST(req: Request) {
     if (phoneNumber) {
       let finalDate = null;
 
+      // Extraemos la fecha leyendo TODO lo que el usuario ha dicho
       if (wantsToBook) {
         const dateExtractor = await fetch("https://openrouter.ai/api/v1/chat/completions", {
           method: "POST",
@@ -49,11 +50,12 @@ export async function POST(req: Request) {
               {
                 role: "system",
                 content: `Hoy es viernes 15 de mayo de 2026. 
-                Lee esta conversación y extrae la FECHA y HORA de la cita que el cliente quiere agendar.
-                Si el cliente ya mencionó cuándo quiere ir (ej: "mañana a las 4pm"), responde ÚNICAMENTE con la fecha en formato: YYYY-MM-DD HH:mm.
-                Si el cliente AÚN NO ha dicho a qué hora o qué día quiere ir, responde estrictamente: NO_DATE.`
+                Analiza el texto del usuario y extrae la FECHA y HORA de la cita.
+                RESPONDE ÚNICAMENTE CON EL FORMATO EXACTO: YYYY-MM-DD HH:mm:00 (Añade los segundos en 00 para la base de datos).
+                Ejemplo: 2026-05-16 16:00:00.
+                Si no hay día y hora clara, responde estrictamente: NO_DATE.`
               },
-              ...messages // Le pasamos el historial real de la charla, no texto suelto
+              { role: "user", content: allUserText } // Le pasamos el resumen limpio
             ]
           })
         });
@@ -61,36 +63,42 @@ export async function POST(req: Request) {
         const dateData = await dateExtractor.json();
         const extracted = dateData.choices[0]?.message?.content?.trim();
         
-        // Verificamos que no sea basura ni un mensaje de error
+        // Verificamos que sea una fecha válida
         if (extracted && extracted !== "NO_DATE" && extracted.includes("2026")) {
           finalDate = extracted;
         }
       }
 
-      // --- 4. ACTUALIZAR O INSERTAR EN SUPABASE ---
-      const { data: existingData } = await supabase
+      // --- 4. ACTUALIZAR O INSERTAR EN SUPABASE (A PRUEBA DE ERRORES) ---
+      // Primero revisamos si este usuario ya existe en la base de datos
+      const { data: existingRecord } = await supabase
         .from("appointments")
-        .select("id")
-        .eq("whatsapp", phoneNumber);
+        .select("*")
+        .eq("whatsapp", phoneNumber)
+        .maybeSingle();
 
-      if (existingData && existingData.length > 0) {
-        // ACTUALIZAMOS (Si ya dio su número antes, ahora le sumamos la fecha)
+      // Escudo: Si la IA falló ahora pero ya teníamos una fecha antes, usamos la vieja.
+      const dateToSave = finalDate ? finalDate : (existingRecord?.appointment_date || null);
+      const statusToSave = dateToSave ? "cita_confirmada" : "solo_lead";
+
+      if (existingRecord) {
+        // ACTUALIZAMOS
         await supabase
           .from("appointments")
           .update({
-            appointment_date: finalDate, // Ahora sí se guardará
+            appointment_date: dateToSave,
             appointment_details: lastUserMessage,
-            status: finalDate ? "cita_confirmada" : "solo_lead",
+            status: statusToSave,
           })
           .eq("whatsapp", phoneNumber);
       } else {
-        // INSERTAMOS (Si es la primera vez que da el número)
+        // INSERTAMOS NUEVO
         await supabase.from("appointments").insert([
           {
             whatsapp: phoneNumber,
-            appointment_date: finalDate,
+            appointment_date: dateToSave,
             appointment_details: lastUserMessage,
-            status: finalDate ? "cita_confirmada" : "solo_lead",
+            status: statusToSave,
             business_name: businessName,
           },
         ]);
@@ -118,7 +126,7 @@ export async function POST(req: Request) {
 
             SITUACIÓN B: El usuario dice que quiere ir (ej: "sí, quiero ir", "mañana a las 4pm"), PERO NO HA DADO SU NÚMERO.
             ACCIÓN: Celebra la decisión y PIDE EL WHATSAPP COMO REQUISITO. 
-            EJEMPLO: "¡Genial! El horario de las 4 PM está perfecto. Para poder anotar tu visita en el sistema y esperarte, ¿me podrías dejar tu número de WhatsApp?"
+            EJEMPLO: "¡Genial! El horario está perfecto. Para poder anotar tu visita en el sistema y esperarte, ¿me podrías dejar tu número de WhatsApp?"
             REGLA DE ORO: ¡NO CONFIRMES LA CITA SI NO TIENES EL NÚMERO!
 
             SITUACIÓN C: El usuario YA TE DIO EL NÚMERO (ej: "mi cel es 71234567") y YA HAY UNA HORA ACORDADA.
