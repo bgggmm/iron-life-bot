@@ -33,7 +33,6 @@ export async function POST(req: Request) {
     const wantsToBook = bookingKeywords.some((key) => allUserText.toLowerCase().includes(key));
 
     // --- 3. LÓGICA DE GUARDADO: SOLO GUARDAR SI HAY NÚMERO ---
-    // Si no hay número, no guardamos "basura" en la base de datos
     if (phoneNumber) {
       let finalDate = null;
 
@@ -50,39 +49,42 @@ export async function POST(req: Request) {
               {
                 role: "system",
                 content: `Hoy es viernes 15 de mayo de 2026. 
-                Analiza todo el texto del usuario y extrae la fecha y hora de la cita. 
-                Si no hay hora clara, responde "NO_DATE". 
-                Si hay, responde ÚNICAMENTE en formato YYYY-MM-DD HH:mm.`
+                Lee esta conversación y extrae la FECHA y HORA de la cita que el cliente quiere agendar.
+                Si el cliente ya mencionó cuándo quiere ir (ej: "mañana a las 4pm"), responde ÚNICAMENTE con la fecha en formato: YYYY-MM-DD HH:mm.
+                Si el cliente AÚN NO ha dicho a qué hora o qué día quiere ir, responde estrictamente: NO_DATE.`
               },
-              { role: "user", content: allUserText }
+              ...messages // Le pasamos el historial real de la charla, no texto suelto
             ]
           })
         });
 
         const dateData = await dateExtractor.json();
         const extracted = dateData.choices[0]?.message?.content?.trim();
-        if (extracted !== "NO_DATE") finalDate = extracted;
+        
+        // Verificamos que no sea basura ni un mensaje de error
+        if (extracted && extracted !== "NO_DATE" && extracted.includes("2026")) {
+          finalDate = extracted;
+        }
       }
 
-      // --- 4. ACTUALIZAR O INSERTAR (Evita el doble registro) ---
-      // Buscamos si este número ya está en la base de datos
+      // --- 4. ACTUALIZAR O INSERTAR EN SUPABASE ---
       const { data: existingData } = await supabase
         .from("appointments")
         .select("id")
         .eq("whatsapp", phoneNumber);
 
       if (existingData && existingData.length > 0) {
-        // Si existe, lo ACTUALIZAMOS (Aquí se unen Fecha y Teléfono en una sola fila)
+        // ACTUALIZAMOS (Si ya dio su número antes, ahora le sumamos la fecha)
         await supabase
           .from("appointments")
           .update({
-            appointment_date: finalDate,
-            appointment_details: lastUserMessage, // Para tener un historial
+            appointment_date: finalDate, // Ahora sí se guardará
+            appointment_details: lastUserMessage,
             status: finalDate ? "cita_confirmada" : "solo_lead",
           })
           .eq("whatsapp", phoneNumber);
       } else {
-        // Si es nuevo, lo INSERTAMOS
+        // INSERTAMOS (Si es la primera vez que da el número)
         await supabase.from("appointments").insert([
           {
             whatsapp: phoneNumber,
