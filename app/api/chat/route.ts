@@ -14,13 +14,13 @@ export async function POST(req: Request) {
     const lastUserMessage = messages[messages.length - 1]?.content || "";
     const businessName = businessContext.split(".")[0];
 
-    // --- 1. UNIR TODO EL HISTORIAL PARA NO PERDER CONTEXTO ---
+    // --- 1. UNIR HISTORIAL ---
     const allUserText = messages
       .filter((m) => m.role === "user")
       .map((m) => m.content)
       .join(" | ");
 
-    // --- 2. EXTRAER TELÉFONO DEL HISTORIAL COMPLETO ---
+    // --- 2. EXTRAER TELÉFONO ---
     const phoneRegex = /(?:\+?591)?\s?[67]\d{7}/g;
     const foundPhone = allUserText.match(phoneRegex);
     const phoneNumber = foundPhone ? foundPhone[foundPhone.length - 1].replace(/\s/g, "") : null;
@@ -32,11 +32,10 @@ export async function POST(req: Request) {
     ];
     const wantsToBook = bookingKeywords.some((key) => allUserText.toLowerCase().includes(key));
 
-    // --- 3. LÓGICA DE GUARDADO: SOLO GUARDAR SI HAY NÚMERO ---
+    // --- 3. LÓGICA DE GUARDADO SÚPER ESTRICTA ---
     if (phoneNumber) {
       let finalDate = null;
 
-      // Extraemos la fecha leyendo TODO lo que el usuario ha dicho
       if (wantsToBook) {
         const dateExtractor = await fetch("https://openrouter.ai/api/v1/chat/completions", {
           method: "POST",
@@ -50,50 +49,56 @@ export async function POST(req: Request) {
               {
                 role: "system",
                 content: `Hoy es viernes 15 de mayo de 2026. 
-                Analiza el texto del usuario y extrae la FECHA y HORA de la cita.
-                RESPONDE ÚNICAMENTE CON EL FORMATO EXACTO: YYYY-MM-DD HH:mm:00 (Añade los segundos en 00 para la base de datos).
-                Ejemplo: 2026-05-16 16:00:00.
-                Si no hay día y hora clara, responde estrictamente: NO_DATE.`
+                Extrae la FECHA y HORA de la cita del texto del usuario.
+                Responde EXCLUSIVAMENTE con el formato: YYYY-MM-DD HH:mm:00
+                Si no hay hora clara, responde: NO_DATE`
               },
-              { role: "user", content: allUserText } // Le pasamos el resumen limpio
+              { role: "user", content: allUserText }
             ]
           })
         });
 
         const dateData = await dateExtractor.json();
-        const extracted = dateData.choices[0]?.message?.content?.trim();
+        const extracted = dateData.choices[0]?.message?.content?.trim() || "";
         
-        // Verificamos que sea una fecha válida
-        if (extracted && extracted !== "NO_DATE" && extracted.includes("2026")) {
-          finalDate = extracted;
+        // 🚀 FILTRO DE FUERZA BRUTA: Extrae SOLO los números de la fecha, ignorando si la IA dice palabras extra
+        const exactDateMatch = extracted.match(/\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/);
+        if (exactDateMatch) {
+          finalDate = exactDateMatch[0]; // Esto asegura que Supabase reciba un formato perfecto
         }
       }
 
-      // --- 4. ACTUALIZAR O INSERTAR EN SUPABASE (A PRUEBA DE ERRORES) ---
-      // Primero revisamos si este usuario ya existe en la base de datos
-      const { data: existingRecord } = await supabase
+      // --- 4. GUARDAR EN SUPABASE (A PRUEBA DE DUPLICADOS) ---
+      // Usamos .limit(1) para evitar el error fatal si hay datos viejos repetidos
+      const { data: existingRecords, error: fetchError } = await supabase
         .from("appointments")
         .select("*")
         .eq("whatsapp", phoneNumber)
-        .maybeSingle();
+        .limit(1);
 
-      // Escudo: Si la IA falló ahora pero ya teníamos una fecha antes, usamos la vieja.
+      if (fetchError) console.error("Error buscando registro:", fetchError);
+
+      const existingRecord = existingRecords?.[0];
       const dateToSave = finalDate ? finalDate : (existingRecord?.appointment_date || null);
       const statusToSave = dateToSave ? "cita_confirmada" : "solo_lead";
 
       if (existingRecord) {
-        // ACTUALIZAMOS
-        await supabase
+        // ACTUALIZAR
+        const { error: updateError } = await supabase
           .from("appointments")
           .update({
             appointment_date: dateToSave,
             appointment_details: lastUserMessage,
             status: statusToSave,
           })
-          .eq("whatsapp", phoneNumber);
+          .eq("id", existingRecord.id); // Actualizamos por ID para mayor seguridad
+          
+        if (updateError) console.error("Error al actualizar:", updateError);
+        else console.log("✅ Fila actualizada correctamente");
+
       } else {
-        // INSERTAMOS NUEVO
-        await supabase.from("appointments").insert([
+        // INSERTAR
+        const { error: insertError } = await supabase.from("appointments").insert([
           {
             whatsapp: phoneNumber,
             appointment_date: dateToSave,
@@ -102,10 +107,13 @@ export async function POST(req: Request) {
             business_name: businessName,
           },
         ]);
+        
+        if (insertError) console.error("Error al insertar:", insertError);
+        else console.log("✅ Nueva fila insertada correctamente");
       }
     }
 
-   // --- 5. RESPUESTA DE LA IA PRINCIPAL (FLUJO ESTRICTO) ---
+   // --- 5. RESPUESTA DE LA IA PRINCIPAL ---
     const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
       method: "POST",
       headers: {
@@ -122,23 +130,21 @@ export async function POST(req: Request) {
             DEBES SEGUIR ESTE FLUJO EXACTO DEPENDIENDO DE LA SITUACIÓN:
 
             SITUACIÓN A: El usuario SOLO pide información (precio, horarios).
-            ACCIÓN: Da la información y haz una pregunta amigable (ej: "¿Te gustaría venir a conocer?"). ¡PROHIBIDO PEDIR WHATSAPP AÚN!
+            ACCIÓN: Da la información y haz una pregunta amigable. ¡PROHIBIDO PEDIR WHATSAPP AÚN!
 
-            SITUACIÓN B: El usuario dice que quiere ir (ej: "sí, quiero ir", "mañana a las 4pm"), PERO NO HA DADO SU NÚMERO.
+            SITUACIÓN B: El usuario dice que quiere ir, PERO NO HA DADO SU NÚMERO.
             ACCIÓN: Celebra la decisión y PIDE EL WHATSAPP COMO REQUISITO. 
-            EJEMPLO: "¡Genial! El horario está perfecto. Para poder anotar tu visita en el sistema y esperarte, ¿me podrías dejar tu número de WhatsApp?"
             REGLA DE ORO: ¡NO CONFIRMES LA CITA SI NO TIENES EL NÚMERO!
 
-            SITUACIÓN C: El usuario YA TE DIO EL NÚMERO (ej: "mi cel es 71234567") y YA HAY UNA HORA ACORDADA.
-            ACCIÓN: AHORA SÍ, CONFIRMA LA CITA.
-            EJEMPLO: "¡Perfecto! Ya anoté tu visita para mañana a las 4 PM. ¡Nos vemos en el gym! 💪"
+            SITUACIÓN C: El usuario YA TE DIO EL NÚMERO y YA HAY UNA HORA ACORDADA.
+            ACCIÓN: AHORA SÍ, CONFIRMA LA CITA. Ej: "¡Perfecto! Ya anoté tu visita para mañana a las 4 PM. ¡Nos vemos en el gym! 💪"
 
             SITUACIÓN D: El usuario te da el número, pero falta la hora.
             ACCIÓN: Agradécele el número y pregúntale a qué hora le gustaría ir.
 
             REGLAS GENERALES:
-            - NUNCA PIDAS CÓDIGO DE PAÍS. Asume que el número es local.
-            - HORARIOS: Abierto de 6 AM a 10 PM. La tarde entera está abierta.`,
+            - NUNCA PIDAS CÓDIGO DE PAÍS. Asume local.
+            - Abierto de 6 AM a 10 PM. La tarde entera está abierta.`,
           },
           ...messages,
         ],
