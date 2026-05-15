@@ -2,7 +2,6 @@ import { NextResponse } from "next/server";
 import { Message, ChatRequestBody } from "../../../types/chat";
 import { createClient } from "@supabase/supabase-js";
 
-// Inicialización de Supabase
 const supabase = createClient(
   process.env.SUPABASE_URL!,
   process.env.SUPABASE_ANON_KEY!
@@ -14,91 +13,83 @@ export async function POST(req: Request) {
     const lastUserMessage = messages[messages.length - 1]?.content || "";
     const businessName = businessContext.split(".")[0];
 
-    // --- 1. UNIR HISTORIAL ---
+    // --- 1. UNIR HISTORIAL PARA EXTRAER DATOS ---
     const allUserText = messages
       .filter((m) => m.role === "user")
       .map((m) => m.content)
       .join(" | ");
 
-    // --- 2. EXTRAER TELÉFONO ---
+    // --- 2. EXTRACCIÓN DE TELÉFONO (Busca en toda la charla) ---
     const phoneRegex = /(?:\+?591)?\s?[67]\d{7}/g;
     const foundPhone = allUserText.match(phoneRegex);
     const phoneNumber = foundPhone ? foundPhone[foundPhone.length - 1].replace(/\s/g, "") : null;
 
-    const bookingKeywords = [
-      "agendar", "cita", "visita", "mañana", "lunes", "martes", 
-      "miércoles", "jueves", "viernes", "sábado", "probar", 
-      "iré", "pasaré", "paso", "am", "pm", "las 4", "las 3", "hora"
-    ];
-    const wantsToBook = bookingKeywords.some((key) => allUserText.toLowerCase().includes(key));
+    // --- 3. EXTRACCIÓN DE FECHA (AHORA ES OBLIGATORIA SI HAY MENSAJES) ---
+    let finalDateStr = null;
+    
+    // Simplificamos el texto para la IA: solo los últimos 3 mensajes para no marearla
+    const recentHistory = messages.slice(-3).map(m => `${m.role}: ${m.content}`).join("\n");
 
-    // --- 3. LÓGICA DE GUARDADO SÚPER ESTRICTA ---
-    if (phoneNumber) {
-      let finalDate = null;
-
-      if (wantsToBook) {
-        const dateExtractor = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
+    const dateExtractor = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: "openai/gpt-4o-mini",
+        messages: [
+          {
+            role: "system",
+            content: `Hoy es viernes 2026-05-15. Tu única tarea es extraer FECHA y HORA de visita.
+            Responde EXCLUSIVAMENTE con el formato: YYYY-MM-DD HH:mm:00
+            Si el usuario no dice una hora clara (ej. solo dice "hola" o "precio"), responde: NO_DATE`
           },
-          body: JSON.stringify({
-            model: "openai/gpt-4o-mini",
-            messages: [
-              {
-                role: "system",
-                content: `Hoy es viernes 15 de mayo de 2026. 
-                Extrae la FECHA y HORA de la cita del texto del usuario.
-                Responde EXCLUSIVAMENTE con el formato: YYYY-MM-DD HH:mm:00
-                Si no hay hora clara, responde: NO_DATE`
-              },
-              { role: "user", content: allUserText }
-            ]
-          })
-        });
+          { role: "user", content: recentHistory }
+        ]
+      })
+    });
 
-        const dateData = await dateExtractor.json();
-        const extracted = dateData.choices[0]?.message?.content?.trim() || "";
-        
-        // 🚀 FILTRO DE FUERZA BRUTA: Extrae SOLO los números de la fecha, ignorando si la IA dice palabras extra
-        const exactDateMatch = extracted.match(/\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/);
-        if (exactDateMatch) {
-          finalDate = exactDateMatch[0]; // Esto asegura que Supabase reciba un formato perfecto
-        }
-      }
+    const dateData = await dateExtractor.json();
+    const extracted = dateData.choices[0]?.message?.content?.trim() || "";
+    
+    // Usamos Regex para capturar solo la fecha y limpiar basura
+    const dateMatch = extracted.match(/\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/);
+    if (dateMatch) {
+      finalDateStr = dateMatch[0];
+      console.log("📅 FECHA DETECTADA POR IA:", finalDateStr);
+    } else {
+      console.log("ℹ️ No se detectó fecha en este mensaje.");
+    }
 
-      // --- 4. GUARDAR EN SUPABASE (A PRUEBA DE DUPLICADOS) ---
-      // Usamos .limit(1) para evitar el error fatal si hay datos viejos repetidos
-      const { data: existingRecords, error: fetchError } = await supabase
+    // --- 4. GUARDADO EN SUPABASE (HORA FIJA COCHABAMBA) ---
+    if (phoneNumber) {
+      const { data: existingRecords } = await supabase
         .from("appointments")
         .select("*")
         .eq("whatsapp", phoneNumber)
         .limit(1);
 
-      if (fetchError) console.error("Error buscando registro:", fetchError);
-
-      const existingRecord = existingRecords?.[0];
-      const dateToSave = finalDate ? finalDate : (existingRecord?.appointment_date || null);
+      const record = existingRecords?.[0];
+      
+      // Enviamos el string directo "YYYY-MM-DD HH:mm:00". 
+      // Supabase (Postgres) lo aceptará tal cual sin moverle las horas.
+      let dateToSave = finalDateStr || (record?.appointment_date || null);
       const statusToSave = dateToSave ? "cita_confirmada" : "solo_lead";
 
-      if (existingRecord) {
-        // ACTUALIZAR
-        const { error: updateError } = await supabase
+      if (record) {
+        const { error: upErr } = await supabase
           .from("appointments")
           .update({
-            appointment_date: dateToSave,
+            appointment_date: dateToSave, 
             appointment_details: lastUserMessage,
             status: statusToSave,
           })
-          .eq("id", existingRecord.id); // Actualizamos por ID para mayor seguridad
-          
-        if (updateError) console.error("Error al actualizar:", updateError);
-        else console.log("✅ Fila actualizada correctamente");
-
+          .eq("id", record.id);
+        
+        if (!upErr) console.log("✅ SINCRONIZADO EN BD (Hora Local):", dateToSave);
       } else {
-        // INSERTAR
-        const { error: insertError } = await supabase.from("appointments").insert([
+        const { error: inErr } = await supabase.from("appointments").insert([
           {
             whatsapp: phoneNumber,
             appointment_date: dateToSave,
@@ -108,12 +99,11 @@ export async function POST(req: Request) {
           },
         ]);
         
-        if (insertError) console.error("Error al insertar:", insertError);
-        else console.log("✅ Nueva fila insertada correctamente");
+        if (!inErr) console.log("✅ REGISTRADO EN BD (Hora Local):", dateToSave);
       }
     }
 
-   // --- 5. RESPUESTA DE LA IA PRINCIPAL ---
+    // --- 5. RESPUESTA AL USUARIO (FLUJO DE AGENDADO ESTRICTO) ---
     const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
       method: "POST",
       headers: {
@@ -125,26 +115,24 @@ export async function POST(req: Request) {
         messages: [
           {
             role: "system",
-            content: `Eres el Asistente VIP de ventas de ${businessContext}. Tu estilo es amigable y servicial.
+            content: `Eres el Asistente VIP de Iron Life Gym. Tu misión es agendar visitas COMPLETAS.
 
-            DEBES SEGUIR ESTE FLUJO EXACTO DEPENDIENDO DE LA SITUACIÓN:
+            REGLA DE ORO: NO CONFIRMES LA CITA SI FALTA EL WHATSAPP O LA HORA.
 
-            SITUACIÓN A: El usuario SOLO pide información (precio, horarios).
-            ACCIÓN: Da la información y haz una pregunta amigable. ¡PROHIBIDO PEDIR WHATSAPP AÚN!
+            PASOS PARA AGENDAR:
+            1. Si el usuario dice que quiere ir, pero NO ha dado su hora ni su WhatsApp:
+               Respuesta: "¡Excelente decisión! Para agendarte, ¿qué número de WhatsApp tienes y a qué hora te gustaría pasar (6am - 10pm)?"
 
-            SITUACIÓN B: El usuario dice que quiere ir, PERO NO HA DADO SU NÚMERO.
-            ACCIÓN: Celebra la decisión y PIDE EL WHATSAPP COMO REQUISITO. 
-            REGLA DE ORO: ¡NO CONFIRMES LA CITA SI NO TIENES EL NÚMERO!
+            2. Si ya te dio el WhatsApp pero FALTA LA HORA:
+               Respuesta: "¡Recibido! Ya tengo tu WhatsApp. Ahora solo confírmame: ¿a qué hora te esperamos mañana?" (NO digas que ya está anotado hasta tener la hora).
 
-            SITUACIÓN C: El usuario YA TE DIO EL NÚMERO y YA HAY UNA HORA ACORDADA.
-            ACCIÓN: AHORA SÍ, CONFIRMA LA CITA. Ej: "¡Perfecto! Ya anoté tu visita para mañana a las 4 PM. ¡Nos vemos en el gym! 💪"
+            3. Si ya te dio la hora pero FALTA EL WHATSAPP:
+               Respuesta: "¡Perfecto a esa hora! Para separar tu espacio y avisar al coach, ¿me dejas tu número de WhatsApp?"
 
-            SITUACIÓN D: El usuario te da el número, pero falta la hora.
-            ACCIÓN: Agradécele el número y pregúntale a qué hora le gustaría ir.
+            4. CUANDO TENGAS AMBOS (Número + Hora):
+               Respuesta: "¡Todo listo! 📝 He agendado tu visita para mañana a las [Hora]. ¡Nos vemos en el gym! 💪"
 
-            REGLAS GENERALES:
-            - NUNCA PIDAS CÓDIGO DE PAÍS. Asume local.
-            - Abierto de 6 AM a 10 PM. La tarde entera está abierta.`,
+            DATOS DEL GYM: Mensualidad 250 Bs, coach incluido. Abierto de 6 AM a 10 PM. Las 4 PM es VÁLIDO.`,
           },
           ...messages,
         ],
